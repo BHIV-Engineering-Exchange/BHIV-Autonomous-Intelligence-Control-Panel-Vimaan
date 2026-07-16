@@ -4,6 +4,7 @@ import {
   Map, Edit, Settings, Database, Trash2, 
   Upload, Eye, RefreshCw, AlertTriangle, X
 } from "lucide-react";
+import { apiBase } from "../config";
 
 export default function TabletPlanner({ uploadMission, isActive }) {
   const mapContainerRef = useRef(null);
@@ -158,7 +159,7 @@ export default function TabletPlanner({ uploadMission, isActive }) {
     if (waypoints.length === 0) return;
     setLoading(true);
     try {
-      const res = await fetch("http://localhost:8000/api/mission", {
+      const res = await fetch(`${apiBase}/api/mission`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -180,10 +181,11 @@ export default function TabletPlanner({ uploadMission, isActive }) {
           })) : null
         })
       });
+
       const data = await res.json();
       if (data.status === "success") {
         // Also send START_MISSION
-        await fetch("http://localhost:8000/api/command", {
+        await fetch(`${apiBase}/api/command`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ command: "START_MISSION" })

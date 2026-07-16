@@ -4,6 +4,7 @@ import PhoneHUD from "./components/PhoneHUD";
 import PhoneTelemetry from "./components/PhoneTelemetry";
 import TabletPlanner from "./components/TabletPlanner";
 import SensorsIngestion from "./components/SensorsIngestion";
+import { apiBase, wsUrl } from "./config";
 import { 
   Laptop, Phone, Monitor, Info, Check, Wifi, WifiOff, 
   Database, RefreshCw, Power, Circle, HelpCircle, Activity
@@ -57,7 +58,7 @@ export default function App() {
   useEffect(() => {
     let socket;
     const connectWS = () => {
-      socket = new WebSocket("ws://localhost:8000/ws/telemetry");
+      socket = new WebSocket(`${wsUrl}/ws/telemetry`);
       wsRef.current = socket;
 
       socket.onmessage = (event) => {
@@ -87,7 +88,7 @@ export default function App() {
   // 2. Fetch past recordings
   const fetchRecordings = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/replay/list");
+      const res = await fetch(`${apiBase}/api/replay/list`);
       const data = await res.json();
       setRecordings(data);
     } catch (err) {
@@ -98,7 +99,7 @@ export default function App() {
   // 3. Command dispatcher
   const sendCommand = async (command, params = null) => {
     try {
-      const res = await fetch("http://localhost:8000/api/command", {
+      const res = await fetch(`${apiBase}/api/command`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command, params })
@@ -135,7 +136,7 @@ export default function App() {
   const uploadMission = async (waypoints) => {
     try {
       // Upload waypoints
-      const res = await fetch("http://localhost:8000/api/mission", {
+      const res = await fetch(`${apiBase}/api/mission`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ waypoints })
@@ -157,10 +158,10 @@ export default function App() {
     setConnecting(true);
     try {
       if (telemetry.connected) {
-        const res = await fetch("http://localhost:8000/api/disconnect", { method: "POST" });
+        const res = await fetch(`${apiBase}/api/disconnect`, { method: "POST" });
         await res.json();
       } else {
-        const res = await fetch("http://localhost:8000/api/connect", {
+        const res = await fetch(`${apiBase}/api/connect`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ connection_type: connType, connection_str: connStr })
@@ -179,7 +180,7 @@ export default function App() {
   // 6. Record start/stop
   const startRecording = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/replay/record/start", { method: "POST" });
+      const res = await fetch(`${apiBase}/api/replay/record/start`, { method: "POST" });
       const data = await res.json();
       if (data.status === "recording") {
         setIsRecording(true);
@@ -192,7 +193,7 @@ export default function App() {
 
   const stopRecording = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/replay/record/stop", { method: "POST" });
+      const res = await fetch(`${apiBase}/api/replay/record/stop`, { method: "POST" });
       const data = await res.json();
       if (data.status === "idle") {
         setIsRecording(false);
@@ -207,7 +208,7 @@ export default function App() {
   const startReplay = async (filename) => {
     if (!filename) return;
     try {
-      const res = await fetch("http://localhost:8000/api/replay/load", {
+      const res = await fetch(`${apiBase}/api/replay/load`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filename })
@@ -223,7 +224,7 @@ export default function App() {
 
   const stopReplay = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/replay/stop", { method: "POST" });
+      const res = await fetch(`${apiBase}/api/replay/stop`, { method: "POST" });
       const data = await res.json();
       if (data.status === "live") {
         setReplayActive(false);

@@ -5,6 +5,7 @@ import {
   Cpu, Radio, Battery, Gauge, Compass, MapPin, Video, Eye,
   Sliders, ClipboardList, Target, SlidersHorizontal
 } from "lucide-react";
+import { apiBase } from "../config";
 
 export default function PCDashboard({ telemetry, sendCommand, isActive }) {
   const mapContainerRef = useRef(null);
@@ -207,7 +208,7 @@ export default function PCDashboard({ telemetry, sendCommand, isActive }) {
                     <Video size={10} /> PIP FPV FEED
                   </div>
                   <img 
-                    src="http://localhost:8000/api/camera/stream" 
+                    src={`${apiBase}/api/camera/stream`} 
                     alt="FPV Stream Thumbnail" 
                     style={{ width: "100%", height: "100%", objectFit: "cover" }}
                     onError={(e) => { e.target.style.display = "none"; }}

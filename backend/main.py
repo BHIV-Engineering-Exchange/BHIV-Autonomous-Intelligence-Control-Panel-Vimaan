@@ -344,3 +344,18 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
         except:
             pass
+
+
+# --- Serve Built Frontend Files (Production/Deployment) ---
+import os
+from fastapi.staticfiles import StaticFiles
+
+# Resolve path to frontend/dist relative to this main.py file
+dist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
+
+if os.path.exists(dist_dir):
+    logger.info(f"Mounting frontend static files from: {dist_dir}")
+    app.mount("/", StaticFiles(directory=dist_dir, html=True), name="frontend")
+else:
+    logger.warning(f"Frontend build folder not found at: {dist_dir}. Serving API only.")
+

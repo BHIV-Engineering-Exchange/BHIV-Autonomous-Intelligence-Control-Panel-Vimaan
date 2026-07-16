@@ -3,10 +3,11 @@ import {
   Home, Compass, Layers, Lock, MapPin, 
   Settings, Camera, ShieldAlert, Circle
 } from "lucide-react";
+import { apiBase } from "../config";
 
 export default function PhoneHUD({ telemetry, sendCommand, startRecording, stopRecording, isRecording }) {
   const canvasRef = useRef(null);
-  const streamUrl = "http://localhost:8000/api/camera/stream";
+  const streamUrl = `${apiBase}/api/camera/stream`;
   const t = telemetry.telemetry || {};
   const [hudConnected, setHudConnected] = useState(true);
 
@@ -35,7 +36,7 @@ export default function PhoneHUD({ telemetry, sendCommand, startRecording, stopR
 
   // Handle camera snapshot click
   const handleSnapshotClick = () => {
-    window.open("http://localhost:8000/api/camera/snapshot?t=" + Date.now(), "_blank");
+    window.open(`${apiBase}/api/camera/snapshot?t=` + Date.now(), "_blank");
   };
 
   // Canvas HUD Overlay drawing loop
