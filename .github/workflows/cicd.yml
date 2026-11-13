@@ -1,0 +1,335 @@
+name: VIMAAN Production Infrastructure CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vimaan-production
+  cancel-in-progress: false
+
+env:
+  BACKEND_IMAGE: bhiv/vimaan-backend
+  FRONTEND_IMAGE: bhiv/vimaan-frontend
+  DEPLOY_DIR: VIMAAN
+
+jobs:
+  validate:
+    name: Validate production deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set short Git SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Verify required deployment files
+        run: |
+          set -euo pipefail
+          test -f backend/Dockerfile
+          test -f frontend/Dockerfile
+          test -f frontend/nginx.conf
+          test -f docker-compose.local.yml
+          test -f docker-compose.prod.yml
+
+      - name: Validate local Docker Compose configuration
+        run: |
+          docker compose -f docker-compose.local.yml config --quiet
+
+      - name: Validate production Docker Compose configuration
+        run: |
+          IMAGE_TAG="$SHORT_SHA" docker compose \
+            -f docker-compose.prod.yml config --quiet
+
+      - name: Validate Dockerfile syntax with Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vimaan-deployment-files
+          if-no-files-found: error
+          path: |
+            docker-compose.prod.yml
+            backend/Dockerfile
+            frontend/Dockerfile
+            frontend/nginx.conf
+
+  build:
+    name: Build and push production images
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name != 'pull_request'
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set short Git commit SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push VIMAAN backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: |
+            bhiv/vimaan-backend:${{ steps.vars.outputs.sha_short }}
+            bhiv/vimaan-backend:latest
+          cache-from: type=gha,scope=vimaan-backend
+          cache-to: type=gha,mode=max,scope=vimaan-backend
+
+      - name: Build and push VIMAAN frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            bhiv/vimaan-frontend:${{ steps.vars.outputs.sha_short }}
+            bhiv/vimaan-frontend:latest
+          cache-from: type=gha,scope=vimaan-frontend
+          cache-to: type=gha,mode=max,scope=vimaan-frontend
+
+  deploy:
+    name: Deploy production stack on VM via SSH
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare deployment archive
+        run: |
+          set -euo pipefail
+          mkdir -p deployment
+          cp docker-compose.prod.yml deployment/docker-compose.prod.yml
+          tar -czf deployment.tar.gz -C deployment docker-compose.prod.yml
+          test -s deployment.tar.gz
+
+      - name: Install sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Create VIMAAN deployment directory on VM
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" ssh \
+            -p "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}" \
+            "mkdir -p ~/${DEPLOY_DIR}/docs"
+
+      - name: Copy deployment archive to VM
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" scp \
+            -P "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            deployment.tar.gz \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}:~/${DEPLOY_DIR}/deployment.tar.gz"
+
+      - name: Deploy production stack on VM
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" ssh \
+            -p "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}" "bash -s" << 'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+          DEPLOY_DIR=VIMAAN
+          cd "$HOME/$DEPLOY_DIR"
+
+          echo "Checking deployment archive..."
+          test -s deployment.tar.gz
+
+          echo "Checking Docker availability..."
+          docker version
+          docker compose version
+
+          # Preserve the currently deployed image tag before changing anything.
+          if [ -f .env ]; then
+            cp .env .env.previous
+            echo "Previous release configuration saved."
+          else
+            echo "No previous release configuration found; this is the first deployment."
+          fi
+
+          # Extract only the deployment Compose file. Persistent recordings are untouched.
+          tar -xzf deployment.tar.gz
+          rm -f deployment.tar.gz
+          test -s docker-compose.prod.yml
+
+          # Configure the immutable image tag for this release.
+          printf 'IMAGE_TAG=%s\n' "${{ needs.build.outputs.sha_short }}" > .env
+
+          echo "Validating production Compose configuration..."
+          docker compose --env-file .env -f docker-compose.prod.yml config --quiet
+
+          echo "Logging in to Docker Hub..."
+          printf '%s' "${{ secrets.DOCKER_PASSWORD }}" | docker login \
+            --username "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+          DEPLOY_STATUS=1
+          cleanup() {
+            docker logout >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "Pulling immutable VIMAAN images..."
+          docker compose --env-file .env -f docker-compose.prod.yml pull
+
+          echo "Starting VIMAAN production services..."
+          docker compose --env-file .env -f docker-compose.prod.yml up -d --remove-orphans
+
+          echo "Current container status:"
+          docker compose --env-file .env -f docker-compose.prod.yml ps
+
+          echo "Waiting for backend and frontend HTTP checks..."
+          BACKEND_OK=0
+          FRONTEND_OK=0
+          for attempt in $(seq 1 18); do
+            BACKEND_OK=0
+            FRONTEND_OK=0
+
+            curl --connect-timeout 5 --max-time 10 -fsS \
+              http://127.0.0.1:8032/docs >/dev/null 2>&1 && BACKEND_OK=1 || true
+            curl --connect-timeout 5 --max-time 10 -fsS \
+              http://127.0.0.1:8088/ >/dev/null 2>&1 && FRONTEND_OK=1 || true
+
+            if [ "$BACKEND_OK" -eq 1 ] && [ "$FRONTEND_OK" -eq 1 ]; then
+              echo "VIMAAN backend and frontend are responding successfully."
+              DEPLOY_STATUS=0
+              break
+            fi
+
+            echo "Attempt ${attempt}/18: backend=${BACKEND_OK}, frontend=${FRONTEND_OK}. Retrying in 10 seconds..."
+            sleep 10
+          done
+
+          if [ "$DEPLOY_STATUS" -ne 0 ]; then
+            echo "Deployment verification failed. Printing diagnostic information..."
+            docker compose --env-file .env -f docker-compose.prod.yml ps || true
+            docker compose --env-file .env -f docker-compose.prod.yml logs --tail=100 || true
+            exit 1
+          fi
+
+          # Record the successful release. Keep the previous manifest/tag for rollback.
+          if [ ! -f docs/RELEASE_HISTORY.md ]; then
+            printf '# VIMAAN Release History\n\n| Timestamp UTC | Image Tag | Status | Description |\n|---|---|---|---|\n' > docs/RELEASE_HISTORY.md
+          fi
+          printf '| %s | %s | SUCCESS | Backend and frontend HTTP checks passed |\n' \
+            "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" \
+            "${{ needs.build.outputs.sha_short }}" >> docs/RELEASE_HISTORY.md
+
+          echo "Production deployment completed successfully."
+          REMOTE_SCRIPT
+
+      - name: Update release documentation
+        if: success()
+        run: |
+          echo "VIMAAN release ${{ needs.build.outputs.sha_short }} was deployed and verified."
+          echo "The VM release registry is maintained at ~/VIMAAN/docs/RELEASE_HISTORY.md."
+
+  rollback:
+    name: Roll back production after deployment failure
+    needs: [build, deploy]
+    if: always() && needs.build.result == 'success' && needs.deploy.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Restore previous production release
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" ssh \
+            -p "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}" "bash -s" << 'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+          DEPLOY_DIR=VIMAAN
+          cd "$HOME/$DEPLOY_DIR"
+
+          if [ ! -s .env.previous ]; then
+            echo "Rollback unavailable: no previous production release was saved."
+            echo "This may be the first deployment."
+            exit 1
+          fi
+
+          echo "Restoring previous image tag..."
+          cp .env.previous .env
+          docker compose --env-file .env -f docker-compose.prod.yml config --quiet
+
+          echo "Logging in to Docker Hub for rollback image pulls..."
+          printf '%s' "${{ secrets.DOCKER_PASSWORD }}" | docker login \
+            --username "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          trap 'docker logout >/dev/null 2>&1 || true' EXIT
+
+          docker compose --env-file .env -f docker-compose.prod.yml pull
+          docker compose --env-file .env -f docker-compose.prod.yml up -d --remove-orphans
+
+          echo "Verifying restored release..."
+          ROLLBACK_OK=0
+          for attempt in $(seq 1 18); do
+            BACKEND_OK=0
+            FRONTEND_OK=0
+            curl --connect-timeout 5 --max-time 10 -fsS \
+              http://127.0.0.1:8032/docs >/dev/null 2>&1 && BACKEND_OK=1 || true
+            curl --connect-timeout 5 --max-time 10 -fsS \
+              http://127.0.0.1:8088/ >/dev/null 2>&1 && FRONTEND_OK=1 || true
+
+            if [ "$BACKEND_OK" -eq 1 ] && [ "$FRONTEND_OK" -eq 1 ]; then
+              ROLLBACK_OK=1
+              break
+            fi
+            echo "Rollback check ${attempt}/18: backend=${BACKEND_OK}, frontend=${FRONTEND_OK}. Retrying..."
+            sleep 10
+          done
+
+          if [ "$ROLLBACK_OK" -ne 1 ]; then
+            echo "Rollback verification failed. Current diagnostics:"
+            docker compose --env-file .env -f docker-compose.prod.yml ps || true
+            docker compose --env-file .env -f docker-compose.prod.yml logs --tail=100 || true
+            if [ -f docs/RELEASE_HISTORY.md ]; then
+              printf '| %s | previous | ROLLBACK_FAILED | Previous release did not pass HTTP checks |\n' \
+                "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> docs/RELEASE_HISTORY.md
+            fi
+            exit 1
+          fi
+
+          if [ ! -f docs/RELEASE_HISTORY.md ]; then
+            printf '# VIMAAN Release History\n\n| Timestamp UTC | Image Tag | Status | Description |\n|---|---|---|---|\n' > docs/RELEASE_HISTORY.md
+          fi
+          RESTORED_TAG="$(sed -n 's/^IMAGE_TAG=//p' .env | head -n 1)"
+          printf '| %s | %s | ROLLBACK_SUCCESS | Previous production release restored and verified |\n' \
+            "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" \
+            "${RESTORED_TAG:-previous}" >> docs/RELEASE_HISTORY.md
+
+          echo "Previous VIMAAN production release restored successfully."
+          REMOTE_SCRIPT
