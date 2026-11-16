@@ -1,8 +1,9 @@
-
 services:
   backend:
     image: bhiv/vimaan-backend:${IMAGE_TAG:?IMAGE_TAG must be set}
     container_name: vimaan-backend
+    env_file:
+      - .env.production
     ports:
       - "8032:8000"
     volumes:
