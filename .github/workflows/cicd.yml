@@ -388,11 +388,13 @@ jobs:
           fi
           echo "Frontend-to-backend API proxy smoke test passed (HTTP 405 expected)."
 
-          # 3. Validate Nginx and confirm its backend proxy configuration.
+          # 3. Validate Nginx configuration.
+          # The API proxy was already verified end-to-end above by checking
+          # that GET /api/connect reaches FastAPI and returns HTTP 405.
+          # Avoid matching a hard-coded upstream string: Compose service
+          # aliases and rendered Nginx formatting can differ.
           docker exec vimaan-frontend nginx -t
-          docker exec vimaan-frontend nginx -T 2>&1 \
-            | grep -F 'proxy_pass http://backend:8000/' >/dev/null
-          echo "Nginx configuration and backend proxy smoke tests passed."
+          echo "Nginx configuration test passed; API proxy was verified end-to-end."
 
           # 4. Confirm both application containers are running.
           for CONTAINER in vimaan-backend vimaan-frontend; do
