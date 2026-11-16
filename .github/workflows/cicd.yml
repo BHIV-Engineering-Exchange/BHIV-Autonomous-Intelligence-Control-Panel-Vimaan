@@ -44,7 +44,11 @@ jobs:
 
       - name: Validate Docker Compose
         run: |
-          IMAGE_TAG=validation docker compose \
+          set -e
+          printf '%s\\n' 'VIMAAN_ENV=validation' > .env.production
+          printf '%s\\n' 'IMAGE_TAG=validation' > .env.validation
+          chmod 600 .env.production .env.validation
+          docker compose --env-file .env.validation \
             -f docker-compose.prod.yml config --quiet
 
       - name: Validate backend Python
@@ -143,12 +147,13 @@ jobs:
           VM_USERNAME: ${{ secrets.VM_USERNAME }}
           VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
           VM_APP_DIR: ${{ secrets.VM_APP_DIR }}
+          VIMAAN_ENV_FILE: ${{ secrets.VIMAAN_ENV_FILE }}
         run: |
           set -e
           for name in \
             DOCKER_USERNAME DOCKER_PASSWORD \
             VM_IP VM_PORT VM_USERNAME \
-            VM_PASSWORD VM_APP_DIR
+            VM_PASSWORD VM_APP_DIR VIMAAN_ENV_FILE
           do
             if [ -z "${!name:-}" ]; then
               echo "ERROR: Missing secret: $name"
@@ -158,11 +163,26 @@ jobs:
           echo "All deployment secrets are present."
 
       - name: Create deployment archive
+        env:
+          VIMAAN_ENV_FILE: ${{ secrets.VIMAAN_ENV_FILE }}
         run: |
           set -e
+          rm -rf deployment deployment.tar.gz
           mkdir -p deployment
+
+          if [ -z "${VIMAAN_ENV_FILE:-}" ]; then
+            echo "ERROR: Missing GitHub secret VIMAAN_ENV_FILE"
+            exit 1
+          fi
+
           cp docker-compose.prod.yml deployment/
+          printf '%s\n' "$VIMAAN_ENV_FILE" > deployment/.env.production
+          chmod 600 deployment/.env.production
+
+          test -s deployment/.env.production
           tar -czf deployment.tar.gz -C deployment .
+          tar -tzf deployment.tar.gz
+          ls -lh deployment.tar.gz
 
       - name: Create VM application directory
         env:
@@ -220,6 +240,8 @@ jobs:
 
           tar -xzf deployment.tar.gz
           rm -f deployment.tar.gz
+          test -s .env.production
+          chmod 600 .env.production
 
           # Preserve the last successful release tag.
           LAST_GOOD_TAG=""
@@ -301,8 +323,92 @@ jobs:
             exit 1
           fi
 
-          # Update last-good tag only after successful health checks.
+          # --------------------------------------------------
+          # Application smoke tests (read-only)
+          # --------------------------------------------------
+          echo "Running VIMAAN application smoke tests..."
+
+          # 1. Backend OpenAPI must respond and expose core routes.
+          curl -fsS --max-time 15 \
+            "http://127.0.0.1:${BACKEND_PORT}/openapi.json" \
+            -o /tmp/vimaan-openapi.json
+
+          python3 - <<'PYSMOKE'
+          import json
+          from pathlib import Path
+
+          schema = json.loads(Path('/tmp/vimaan-openapi.json').read_text())
+          assert schema.get('openapi'), 'Backend OpenAPI document is missing its version'
+          paths = schema.get('paths', {})
+          required = {
+              '/api/connect',
+              '/api/disconnect',
+              '/api/command',
+              '/api/mission',
+          }
+          missing = sorted(required - set(paths))
+          if missing:
+              raise SystemExit(f'Missing expected backend API routes: {missing}')
+          if 'post' not in paths['/api/connect']:
+              raise SystemExit('Expected POST /api/connect is not registered')
+          print(f'Backend OpenAPI smoke test passed ({len(paths)} paths found).')
+          PYSMOKE
+
+          # 2. Frontend must return its SPA document and reference a JS bundle.
+          curl -fsS --max-time 15 \
+            "http://127.0.0.1:${FRONTEND_PORT}/" \
+            -o /tmp/vimaan-index.html
+
+          ASSET_PATH="$(grep -oE "src=\"[^\"]+\\.js([?][^\"]*)?\"" /tmp/vimaan-index.html \
+            | head -n 1 | cut -d '"' -f2)"
+
+          if [ -z "$ASSET_PATH" ]; then
+            echo "ERROR: Frontend HTML does not reference a JavaScript bundle."
+            exit 1
+          fi
+
+          case "$ASSET_PATH" in
+            http://*|https://*) ASSET_URL="$ASSET_PATH" ;;
+            /*) ASSET_URL="http://127.0.0.1:${FRONTEND_PORT}${ASSET_PATH}" ;;
+            *) ASSET_URL="http://127.0.0.1:${FRONTEND_PORT}/${ASSET_PATH}" ;;
+          esac
+
+          curl -fsS --max-time 15 "$ASSET_URL" -o /dev/null
+          echo "Frontend HTML and JavaScript bundle smoke tests passed."
+
+          # GET is intentionally used against this POST-only endpoint:
+          # HTTP 405 proves Nginx forwarded the request to FastAPI without
+          # triggering a drone connection or other state-changing action.
+          PROXY_STATUS="$(curl -sS --max-time 15 -o /dev/null \
+            -w '%{http_code}' \
+            "http://127.0.0.1:${FRONTEND_PORT}/api/connect")"
+          if [ "$PROXY_STATUS" != "405" ]; then
+            echo "ERROR: Frontend-to-backend API proxy returned HTTP $PROXY_STATUS; expected 405."
+            exit 1
+          fi
+          echo "Frontend-to-backend API proxy smoke test passed (HTTP 405 expected)."
+
+          # 3. Validate Nginx and confirm its backend proxy configuration.
+          docker exec vimaan-frontend nginx -t
+          docker exec vimaan-frontend nginx -T 2>&1 \
+            | grep -F 'proxy_pass http://backend:8000/' >/dev/null
+          echo "Nginx configuration and backend proxy smoke tests passed."
+
+          # 4. Confirm both application containers are running.
+          for CONTAINER in vimaan-backend vimaan-frontend; do
+            RUNNING="$(docker inspect --format='{{.State.Running}}' "$CONTAINER")"
+            if [ "$RUNNING" != "true" ]; then
+              echo "ERROR: $CONTAINER is not running."
+              exit 1
+            fi
+          done
+
+          echo "All VIMAAN smoke tests passed."
+
+          # Update last-good tag only after health checks and smoke tests pass.
           echo "$SHORT_SHA" > release_history/LAST_GOOD_TAG
+          cp .env.production release_history/LAST_GOOD_ENV.production
+          chmod 600 release_history/LAST_GOOD_ENV.production
 
           if [ ! -f release_history/RELEASE_HISTORY.md ]; then
             printf '%s\n' \
@@ -376,6 +482,14 @@ jobs:
 
           LAST_GOOD_TAG="$(cat release_history/LAST_GOOD_TAG)"
           echo "Rolling back to: $LAST_GOOD_TAG"
+
+          if [ ! -s release_history/LAST_GOOD_ENV.production ]; then
+            echo "ERROR: Last known-good environment file is missing."
+            exit 1
+          fi
+
+          cp release_history/LAST_GOOD_ENV.production .env.production
+          chmod 600 .env.production
 
           printf '%s' "$PASSWORD_B64" | base64 -d | \
             timeout 90s docker login \
